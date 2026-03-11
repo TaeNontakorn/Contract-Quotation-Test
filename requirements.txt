@@ -6,3 +6,6 @@ google-genai
 pdfplumber
 python-docx
 python-multipart
+mammoth
+streamlit
+requests
