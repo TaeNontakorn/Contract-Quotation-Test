@@ -354,7 +354,7 @@ with tab_check:
                     "api_key": api_key}
 
             try:
-                response = requests.post(API_URL, files=files, data=data, timeout=300)
+                response = requests.post(API_URL, files=files, data=data, timeout=1000)
                 response.raise_for_status()
                 result = response.json()
             except requests.exceptions.ConnectionError:
