@@ -36,7 +36,7 @@ app = FastAPI()
 # แก้ CORS: ถ้าใช้ credentials ต้องระบุ origin จริง ไม่ใช่ *
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501"],  # เปลี่ยนเป็น URL จริงของ Streamlit
+    allow_origins=["https://contract-quotation-test-uxkpb378dnukgacrz29msx.streamlit.app/"],  # เปลี่ยนเป็น URL จริงของ Streamlit
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
