@@ -9,8 +9,8 @@ st.set_page_config(
     layout="wide"
 )
 
-API_URL = "https://contract-quotation-recheck.onrender.com/recheck"
-HISTORY_URL = "https://contract-quotation-recheck.onrender.com/history"
+API_URL = "https://contract-quotation-test.onrender.com/recheck"
+HISTORY_URL = "https://contract-quotation-test.onrender.com/history"
 
 # =========================
 # Custom CSS
