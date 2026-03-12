@@ -134,6 +134,74 @@ def sort_by_severity(items: List[dict]) -> List[dict]:
     return sorted(items, key=lambda x: order.get(x.get("severity", "ต่ำ"), 3))
 
 
+def _parse_date(date_str: str):
+    """แปลง DD/MM/YYYY (พ.ศ. หรือ ค.ศ.) เป็น date object — คืน None ถ้าแปลงไม่ได้"""
+    if not date_str:
+        return None
+    from datetime import date as date_cls
+    try:
+        d, m, y = date_str.strip().split("/")
+        d, m, y = int(d), int(m), int(y)
+        if y > 2400:   # พ.ศ. → ค.ศ.
+            y -= 543
+        return date_cls(y, m, d)
+    except Exception:
+        return None
+
+
+def build_period_card(cp: dict) -> dict:
+    """รับ contract_period จาก LLM แล้วคำนวณวันจริงและสร้าง card"""
+    from datetime import date as date_cls
+
+    q_start = _parse_date(cp.get("quotation_start"))
+    q_end   = _parse_date(cp.get("quotation_end"))
+    c_start = _parse_date(cp.get("contract_start"))
+    c_end   = _parse_date(cp.get("contract_end"))
+
+    # ใช้วันที่จากสัญญาเป็นหลัก fallback ไปใบเสนอราคา
+    start = c_start or q_start
+    end   = c_end   or q_end
+
+    def fmt(d):
+        if not d:
+            return "—"
+        y = d.year + 543
+        return f"{d.day:02d}/{d.month:02d}/{y}"
+
+    q_text = f"วันเริ่มต้น: {fmt(q_start)}  วันสิ้นสุด: {fmt(q_end)}"
+    c_text = f"วันเริ่มต้น: {fmt(c_start)}  วันสิ้นสุด: {fmt(c_end)}"
+
+    if start and end:
+        total_days = (end - start).days + 1
+        # ครบ 1 ปีปฏิทิน = วันสิ้นสุดตรงกับ start + 1 ปี - 1 วัน
+        try:
+            expected_end = start.replace(year=start.year + 1) - __import__("datetime").timedelta(days=1)
+            is_full_year = (end == expected_end)
+        except ValueError:
+            is_full_year = (total_days in (365, 366))
+
+        if is_full_year:
+            explanation = f"✅ ครบ 1 ปีพอดี ({total_days:,} วัน)"
+            severity    = "ต่ำ"
+        else:
+            explanation = f"⚠️ ไม่ครบ 1 ปี (ระยะเวลาจริง {total_days:,} วัน)"
+            severity    = "สูง"
+    else:
+        explanation  = "❓ ไม่พบข้อมูลวันที่ในเอกสาร"
+        severity     = "ปานกลาง"
+
+    return {
+        "title":          "ระยะเวลาสัญญา",
+        "field":          "วันเริ่มต้น-สิ้นสุดสัญญา",
+        "type":           "ถ้อยคำต่างแต่ความหมายเหมือนกัน",
+        "quotation_text": q_text,
+        "contract_text":  c_text,
+        "explanation":    explanation,
+        "severity":       severity,
+        "confidence":     1.0,
+    }
+
+
 # =========================================================
 # TEXT HELPERS
 # =========================================================
@@ -784,9 +852,9 @@ def compare_documents(
 ฟิลด์ที่ต้องตรวจสอบเป็นพิเศษ:
 
 [กำหนดระยะเวลา]
-- field = "วันเริ่มต้น-สิ้นสุดสัญญา" : นำวันที่จากใบเสนอราคามาตรวจกับ สัญญา ITAP ข้อที่ 1
-- ระยะเวลาต้องครบ 1 ปีพอดีตามปฏิทิน
-- ให้ข้ามการตรวจ "การบอกเลิกก่อนกำหนด" — โฟกัสเฉพาะ "วันสิ้นสุดตามระยะเวลา" เท่านั้น
+- ให้ข้ามการตรวจ "การบอกเลิกก่อนกำหนด" โฟกัสเฉพาะ "วันสิ้นสุดตามระยะเวลา" เท่านั้น
+- ดึงวันที่เริ่มต้นและสิ้นสุดสัญญาจากทั้งใบเสนอราคาและสัญญา แล้วใส่ใน contract_period ของ JSON output
+- ห้ามคำนวณจำนวนวันหรือตัดสินว่าครบปีหรือไม่ — ให้ดึงแค่วันที่ดิบจากเอกสารเท่านั้น
 
 [การชำระเงินและขอบเขต]
 - field = "Mango Anywhere Software - ยอดรวม" : ตรวจยอด Total Amount ทุกจุดให้ตรงกัน
@@ -878,6 +946,12 @@ def compare_documents(
 {{
   "summary": {{
       "overall_risk": "ต่ำ | ปานกลาง | สูง"
+  }},
+  "contract_period": {{
+      "quotation_start": "วันที่เริ่มต้นจากใบเสนอราคา รูปแบบ DD/MM/YYYY หรือ null ถ้าไม่พบ",
+      "quotation_end":   "วันที่สิ้นสุดจากใบเสนอราคา รูปแบบ DD/MM/YYYY หรือ null ถ้าไม่พบ",
+      "contract_start":  "วันที่เริ่มต้นจากสัญญา รูปแบบ DD/MM/YYYY หรือ null ถ้าไม่พบ",
+      "contract_end":    "วันที่สิ้นสุดจากสัญญา รูปแบบ DD/MM/YYYY หรือ null ถ้าไม่พบ"
   }},
   "dbd_validation": [
       {{
@@ -1044,10 +1118,15 @@ async def recheck(
         logger.info(f"[ TEXT CHECK ] Contract ({len(contract_text)} chars) preview: {contract_text[:300]}")
         result_one = await asyncio.to_thread(compare_documents, quotation_text, contract_text, dbd_data, client)
 
+        # ── คำนวณวันจริงด้วย Python แล้ว inject card เข้า document_comparison ──
+        cp          = result_one.get("contract_period") or {}
+        period_card = build_period_card(cp)
+        doc_cmp     = [period_card] + result_one.get("document_comparison", [])
+
         result = {
             "summary":                       result_one.get("summary", {}),
             "dbd_validation":                sort_by_severity(result_one.get("dbd_validation", [])),
-            "document_comparison":           sort_by_severity(result_one.get("document_comparison", [])),
+            "document_comparison":           sort_by_severity(doc_cmp),
             "contract_internal_consistency": sort_by_severity(result_one.get("contract_internal_consistency", [])),
             "raw_dbd_data":                  dbd_data,
             "dbd_reg_match":                 reg_match,
