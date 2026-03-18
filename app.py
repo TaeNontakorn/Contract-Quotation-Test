@@ -284,16 +284,26 @@ with tab_check:
 
     # ── แถวที่ 1: ใบเสนอราคา ──
     row1_left, row1_right = st.columns([1, 2])
+
     with row1_left:
         st.markdown("### 📑 ใบเสนอราคา (Quotation)")
-        quotation_file = st.file_uploader("อัปโหลดไฟล์ PDF", type=["pdf"], key="quotation")
-        if quotation_file:
+
+        quotation_files = st.file_uploader(
+            "อัปโหลดไฟล์ PDF",
+            type=["pdf"],
+            key="quotation",
+            accept_multiple_files=True
+        )
+
+        if quotation_files:
             st.markdown("✔️ **อัปโหลดสำเร็จ**")
         else:
             st.markdown("❌ **ยังไม่ได้อัปโหลด**")
+
     with row1_right:
-        if quotation_file:
-            render_pdf(quotation_file)
+        if quotation_files:
+            for file in quotation_files:
+                render_pdf(file)
 
     st.markdown("---")
 
@@ -333,7 +343,7 @@ with tab_check:
         missing = []
         if checker_name == "— เลือกชื่อผู้ตรวจสอบ —" or not checker_name:
             missing.append("ชื่อผู้ตรวจสอบ")
-        if not quotation_file:
+        if not quotation_files:
             missing.append("ใบเสนอราคา")
         if not contract_file:
             missing.append("สัญญา")
@@ -345,11 +355,14 @@ with tab_check:
 
         # ── call API ──
         with st.spinner("กำลังประมวลผลเอกสาร..."):
-            files = {
-                "quotation": (quotation_file.name, quotation_file.getvalue(), "application/pdf"),
-                "contract":  (contract_file.name,  contract_file.getvalue(),  "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-                "dbd_pdf":   (dbd_file.name,        dbd_file.getvalue(),       "application/pdf"),
-            }
+            # ส่ง quotation หลายไฟล์ในรูปแบบ list of tuples (multipart)
+            files = [
+                ("contract", (contract_file.name, contract_file.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+                ("dbd_pdf",  (dbd_file.name,       dbd_file.getvalue(),      "application/pdf")),
+            ]
+            for qf in quotation_files:
+                files.append(("quotation", (qf.name, qf.getvalue(), "application/pdf")))
+
             data = {"checker_name": checker_name,
                     "api_key": api_key}
 
@@ -429,7 +442,8 @@ with tab_history:
                 company     = item.get("company_name", "—")
                 checker     = item.get("checker_name", "—")
                 reg_num     = item.get("registration_number", "—")
-                q_file      = item.get("quotation_filename", "—")
+                q_file_raw  = item.get("quotation_filename", "—")
+                q_file      = ", ".join(q_file_raw) if isinstance(q_file_raw, list) else q_file_raw
                 c_file      = item.get("contract_filename", "—")
 
                 with st.expander(

@@ -992,7 +992,7 @@ def compare_documents(
 """
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-pro",
         contents=prompt,
         config={"temperature": 0},  # temperature=0 → ผลลัพธ์ stable ไม่สุ่ม
     )
@@ -1038,7 +1038,7 @@ async def get_history():
 
 @app.post("/recheck")
 async def recheck(
-    quotation:    UploadFile = File(...),
+    quotation: List[UploadFile] = File(...),
     contract:     UploadFile = File(...),
     dbd_pdf:      UploadFile = File(...),
     checker_name: str = Form("—"),
@@ -1054,8 +1054,12 @@ async def recheck(
         # ===============================
         logger.info("[ OCR ] กำลัง OCR ด้วย Gemini...")
 
-        # quotation ใช้ Gemini OCR (PDF)
-        quotation_text = await run_ocr(quotation, QUOTATION_OCR_PROMPT, client)
+        quotation_text = ""
+
+        for file in quotation:
+            text = await run_ocr(file, QUOTATION_OCR_PROMPT, client)
+            quotation_text += f"\n--- QUOTATION {file.filename} ---\n"
+            quotation_text += text
 
         # contract ใช้ smart_docx_extract (.docx) — บันทึก temp file ก่อน
         contract_bytes = await contract.read()
@@ -1142,9 +1146,10 @@ async def recheck(
             dedup_window = 1  # วินาที
 
             # deduplication: ตรวจสอบว่ามี record ที่มี quotation+contract filename เดิม
+            quotation_filenames = sorted([f.filename for f in quotation])
             existing = checks_col.find_one({
                 "registration_number": safe_reg,
-                "quotation_filename":  quotation.filename,
+                "quotation_filename":  quotation_filenames,
                 "contract_filename":   contract.filename,
                 "checker_name":        checker_name,
                 "created_at":          {"$gte": now_ts - dedup_window},
@@ -1157,7 +1162,7 @@ async def recheck(
                     "registration_number": safe_reg,
                     "company_name":        company_name,
                     "checker_name":        checker_name,
-                    "quotation_filename":  quotation.filename,
+                    "quotation_filename":  quotation_filenames,
                     "contract_filename":   contract.filename,
                     "dbd_filename":        dbd_pdf.filename,
                     "result":              result,
