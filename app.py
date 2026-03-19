@@ -165,15 +165,28 @@ def render_pdf(file):
         </iframe>
     """, unsafe_allow_html=True)
 
+def _safe(val):
+    """คง <strong> ไว้เพื่อ highlight คำผิดสีแดง แต่ลบ tag อื่นทั้งหมดออก"""
+    import re as _re, html as _html
+    text = str(val) if val is not None else '—'
+    parts = _re.split(r'(<strong[^>]*>.*?</strong>)', text, flags=_re.DOTALL)
+    result = []
+    for part in parts:
+        if _re.match(r'<strong[^>]*>', part, flags=_re.DOTALL):
+            result.append(part)  # คง <strong> ไว้
+        else:
+            result.append(_html.unescape(_re.sub(r'<[^>]+>', '', part)))
+    return ''.join(result)
+
 def render_cards(items, fields):
     for item in sort_by_severity(items):
         sev_raw   = item.get("severity", "ต่ำ")
         sev_class = map_severity(sev_raw)
-        title     = item.get("title", "")
+        title     = _safe(item.get("title", ""))
         title_html = f"<div class='card-title'>{title}</div>" if title else ""
         rows_html = "".join(
             f"<div class='content-row'><span class='label'>{label} :</span> "
-            f"<span class='{css}'>{item.get(key, '—')}</span></div>"
+            f"<span class='{css}'>{_safe(item.get(key, '—'))}</span></div>"
             for label, key, css in fields
         )
         st.markdown(f"""
@@ -311,14 +324,24 @@ with tab_check:
     row2_left, row2_right = st.columns([1, 2])
     with row2_left:
         st.markdown("### 📜 สัญญา (Contract)")
-        contract_file = st.file_uploader("อัปโหลดไฟล์ Word", type=["docx"], key="contract")
+        contract_file = st.file_uploader(
+            "อัปโหลดไฟล์ PDF หรือ Word (.pdf, .docx)",
+            type=["pdf", "docx"],
+            key="contract"
+        )
         if contract_file:
-            st.markdown("✔️ **อัปโหลดสำเร็จ**")
+            ext = contract_file.name.rsplit(".", 1)[-1].lower()
+            icon = "📄" if ext == "docx" else "📑"
+            st.markdown(f"✔️ **อัปโหลดสำเร็จ** — {icon} ตรวจพบไฟล์ **{ext.upper()}**")
         else:
             st.markdown("❌ **ยังไม่ได้อัปโหลด**")
     with row2_right:
         if contract_file:
-            st.info(f"📄 {contract_file.name}")
+            ext = contract_file.name.rsplit(".", 1)[-1].lower()
+            if ext == "pdf":
+                render_pdf(contract_file)
+            else:
+                st.info(f"📄 {contract_file.name} (Word document)")
 
     st.markdown("---")
 
@@ -355,10 +378,17 @@ with tab_check:
 
         # ── call API ──
         with st.spinner("กำลังประมวลผลเอกสาร..."):
-            # ส่ง quotation หลายไฟล์ในรูปแบบ list of tuples (multipart)
+            
+            # เลือก MIME type ตามนามสกุลไฟล์ที่อัปโหลด
+            contract_ext  = contract_file.name.rsplit(".", 1)[-1].lower()
+            contract_mime = (
+                "application/pdf"
+                if contract_ext == "pdf"
+                else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
             files = [
-                ("contract", (contract_file.name, contract_file.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
-                ("dbd_pdf",  (dbd_file.name,       dbd_file.getvalue(),      "application/pdf")),
+                ("contract", (contract_file.name, contract_file.getvalue(), contract_mime)),
+                ("dbd_pdf",  (dbd_file.name,      dbd_file.getvalue(),      "application/pdf")),
             ]
             for qf in quotation_files:
                 files.append(("quotation", (qf.name, qf.getvalue(), "application/pdf")))
@@ -442,8 +472,7 @@ with tab_history:
                 company     = item.get("company_name", "—")
                 checker     = item.get("checker_name", "—")
                 reg_num     = item.get("registration_number", "—")
-                q_file_raw  = item.get("quotation_filename", "—")
-                q_file      = ", ".join(q_file_raw) if isinstance(q_file_raw, list) else q_file_raw
+                q_file      = item.get("quotation_filename", "—")
                 c_file      = item.get("contract_filename", "—")
 
                 with st.expander(

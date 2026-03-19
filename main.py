@@ -42,6 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 def get_api_key(form_key: str = "") -> str:
     """ใช้ key จาก form ถ้ามี ไม่งั้น fallback ไป env"""
     if form_key and form_key.strip():
@@ -148,9 +149,7 @@ def _parse_date(date_str: str):
     except Exception:
         return None
 
-
 def build_period_card(cp: dict) -> dict:
-    """รับ contract_period จาก LLM แล้วคำนวณวันจริงและสร้าง card"""
     from datetime import date as date_cls
 
     q_start = _parse_date(cp.get("quotation_start"))
@@ -158,7 +157,6 @@ def build_period_card(cp: dict) -> dict:
     c_start = _parse_date(cp.get("contract_start"))
     c_end   = _parse_date(cp.get("contract_end"))
 
-    # ใช้วันที่จากสัญญาเป็นหลัก fallback ไปใบเสนอราคา
     start = c_start or q_start
     end   = c_end   or q_end
 
@@ -171,9 +169,15 @@ def build_period_card(cp: dict) -> dict:
     q_text = f"วันเริ่มต้น: {fmt(q_start)}  วันสิ้นสุด: {fmt(q_end)}"
     c_text = f"วันเริ่มต้น: {fmt(c_start)}  วันสิ้นสุด: {fmt(c_end)}"
 
-    if start and end:
+    # เช็คว่าวันที่หายไปฝั่งไหน
+    if not q_start and not q_end:
+        explanation = "วันที่ในใบเสนอราคาหายไป"
+        severity    = "สูง"
+    elif not c_start and not c_end:
+        explanation = "วันที่ในสัญญาหายไป"
+        severity    = "สูง"
+    elif start and end:
         total_days = (end - start).days + 1
-        # ครบ 1 ปีปฏิทิน = วันสิ้นสุดตรงกับ start + 1 ปี - 1 วัน
         try:
             expected_end = start.replace(year=start.year + 1) - __import__("datetime").timedelta(days=1)
             is_full_year = (end == expected_end)
@@ -187,8 +191,8 @@ def build_period_card(cp: dict) -> dict:
             explanation = f"⚠️ ไม่ครบ 1 ปี (ระยะเวลาจริง {total_days:,} วัน)"
             severity    = "สูง"
     else:
-        explanation  = "❓ ไม่พบข้อมูลวันที่ในเอกสาร"
-        severity     = "ปานกลาง"
+        explanation = "❓ ไม่พบข้อมูลวันที่ในเอกสาร"
+        severity    = "สูง"
 
     return {
         "title":          "ระยะเวลาสัญญา",
@@ -200,7 +204,6 @@ def build_period_card(cp: dict) -> dict:
         "severity":       severity,
         "confidence":     1.0,
     }
-
 
 # =========================================================
 # TEXT HELPERS
@@ -443,6 +446,29 @@ async def run_ocr(upload: UploadFile, prompt: str, client: genai.Client) -> str:
             os.remove(tmp_path)
 
 
+async def _ocr_from_bytes(file_bytes: bytes, filename: str, prompt: str, client: genai.Client) -> str:
+    """
+    OCR จาก bytes โดยตรง — ใช้สำหรับ Smart File Parser
+    เมื่อไฟล์ contract เป็น PDF ให้ส่ง bytes เข้ามาแทน UploadFile
+    """
+    ext = (filename or "").rsplit(".", 1)[-1].lower() or "pdf"
+    tmp_path = None
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        uploaded_file = await asyncio.to_thread(client.files.upload, file=tmp_path)
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.5-flash",
+            contents=[uploaded_file, prompt],
+        )
+        return response.text.strip()
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 # =========================================================
 # Word Read
 # =========================================================
@@ -605,6 +631,7 @@ def smart_docx_extract(file_path: str) -> str:
     text = extract_docx_faithful(file_path)
     logger.info(f"✅ Extracted length: {len(text)} characters")
     return text
+
 
 
 # =========================================================
@@ -841,7 +868,7 @@ def compare_documents(
 - ใบเสนอราคา คือข้อมูลเชิงพาณิชย์ที่ถูกต้องที่สุด
 - เปรียบเทียบเฉพาะ Quotation กับ Contract
 - ห้ามใช้ DBD ในส่วนนี้
-- ถ้าเจอข้อที่แตกต่างกันต้องระบุเลขหน้าและหัวข้อกำกับไว้ในทุกๆ คำตอบอย่างเคร่งครัด
+- ห้ามระบุเลขหน้าของใบเสนอราคาในผลลัพธ์ — ใน quotation_text ให้คัดลอกข้อความที่เกี่ยวข้องโดยตรง ไม่ต้องบอกว่ามาจากหน้าไหน
 - ไม่ต้องตรวจจับ หัก % ณ ที่จ่าย
 
 ให้ตรวจสอบ:
@@ -852,9 +879,12 @@ def compare_documents(
 ฟิลด์ที่ต้องตรวจสอบเป็นพิเศษ:
 
 [กำหนดระยะเวลา]
-- ให้ข้ามการตรวจ "การบอกเลิกก่อนกำหนด" โฟกัสเฉพาะ "วันสิ้นสุดตามระยะเวลา" เท่านั้น
 - ดึงวันที่เริ่มต้นและสิ้นสุดสัญญาจากทั้งใบเสนอราคาและสัญญา แล้วใส่ใน contract_period ของ JSON output
 - ห้ามคำนวณจำนวนวันหรือตัดสินว่าครบปีหรือไม่ — ให้ดึงแค่วันที่ดิบจากเอกสารเท่านั้น
+- ใน quotation_text และ contract_text ให้แสดงวันที่แยกชัดเจนดังนี้:
+  วันเริ่มต้น: DD/MM/YYYY
+  วันสิ้นสุด: DD/MM/YYYY
+  (ถ้าไม่พบให้ระบุ "ไม่พบ")
 
 [การชำระเงินและขอบเขต]
 - field = "Mango Anywhere Software - ยอดรวม" : ตรวจยอด Total Amount ทุกจุดให้ตรงกัน
@@ -867,9 +897,18 @@ def compare_documents(
 - ถ้าการตรวจต้องมีก่อน vat และหลัง vat ให้ตรวจสอบว่ามีการระบุอย่างชัดเจนว่าเป็นยอดก่อน vat หรือหลัง vat และยอดต้องตรงกัน
 
 
-[สิทธิการใช้งาน]
-- field = "User License" : ระบุให้ชัดว่าเป็น "จำกัดจำนวนผู้ใช้" หรือ "ไม่จำกัด (Unlimited)"
-- ตัวเลขจำนวน User ต้องตรงกันทั้งสองฝ่าย
+[สิทธิการใช้งาน / จำนวนผู้ใช้]
+- field = "User License / จำนวนผู้ใช้งาน"
+- ให้ค้นหาทุกคำที่อาจหมายถึงจำนวนผู้ใช้: "user", "users", "ผู้ใช้งาน", "license", "seat", "account", "named user", "concurrent user", "จำนวนผู้ใช้", "สิทธิ์การใช้งาน"
+- เปรียบเทียบตัวเลขจำนวนผู้ใช้ให้ตรงกันทั้งสองเอกสาร
+- ระบุให้ชัดว่าเป็น "จำกัดจำนวน X คน" หรือ "ไม่จำกัด (Unlimited)"
+- ถ้าใบเสนอราคาระบุจำนวน แต่สัญญาไม่ระบุ หรือระบุไม่ตรงกัน ให้รายงานทันที severity = "สูง"
+
+[การบอกเลิกสัญญา]
+- ตรวจสอบเงื่อนไขการบอกเลิกสัญญาทั้งสองฝ่าย (ใบเสนอราคา vs สัญญา)
+- ตรวจสอบ: ระยะเวลาแจ้งล่วงหน้า (Notice Period) / เหตุผลที่สามารถบอกเลิกได้ / ผลกระทบหลังบอกเลิก (การคืนเงิน ค่าปรับ ฯลฯ)
+- ถ้าใบเสนอราคามีข้อกำหนดการบอกเลิก แต่สัญญาไม่มีหรือแตกต่างกัน ให้รายงานเป็น "ข้อมูลขาดในสัญญา" หรือ "แตกต่างอย่างมีนัยสำคัญ"
+- field = "การบอกเลิกสัญญา"
 
 [ITAP]
 - ถ้าข้อมูลเข้าร่วมโครงการ ITAP โดย สวทช. สนับสนุน 50% (ไม่เกิน / 150,000 บาท) ของค่าขึ้นระบบ (implement) / โดยลูกค้าสำรองจ่ายก่อน / และเบิกคืนหลังจากระบบขึ้นใช้งานเรียบร้อยแล้ว หายไปจากสัญญา ไม่ต้องเตือน
@@ -970,7 +1009,7 @@ def compare_documents(
           "title": "ประโยคสรุปสั้นๆ ที่บอกว่า field อะไร มีปัญหาอะไร เช่น 'จำนวน User License ในสัญญาไม่ตรงกับใบเสนอราคา'",
           "field": "ชื่อบริษัท | ราคา | จำนวนผู้ใช้งาน | วันที่ | หน้าที่ความรับผิดชอบ | อื่น ๆ",
           "type": "อาจเป็นการสะกดผิด | ถ้อยคำต่างแต่ความหมายเหมือนกัน | แตกต่างเล็กน้อย | แตกต่างอย่างมีนัยสำคัญ | ข้อมูลขาดในสัญญา | ข้อมูลขาดทั้งสองฝ่าย",
-          "quotation_text": "หน้า N  แถวที่ N ...",
+          "quotation_text": "ข้อความจากใบเสนอราคาที่เกี่ยวข้อง (ไม่ต้องระบุเลขหน้า)",
           "contract_text": "ข้อที่ N ...",
           "explanation": "อธิบายเป็นภาษาไทย โดยอ้างอิงข้อความในเอกสารเข้าใจได้ง่าย",
           "severity": "ต่ำ | ปานกลาง | สูง",
@@ -992,7 +1031,7 @@ def compare_documents(
 """
 
     response = client.models.generate_content(
-        model="gemini-2.5-pro",
+        model="gemini-2.5-flash",
         contents=prompt,
         config={"temperature": 0},  # temperature=0 → ผลลัพธ์ stable ไม่สุ่ม
     )
@@ -1061,15 +1100,24 @@ async def recheck(
             quotation_text += f"\n--- QUOTATION {file.filename} ---\n"
             quotation_text += text
 
-        # contract ใช้ smart_docx_extract (.docx) — บันทึก temp file ก่อน
+        # ── Smart File Parser: เลือกวิธีอ่านตามนามสกุลไฟล์ ──
         contract_bytes = await contract.read()
+        contract_ext   = (contract.filename or "").rsplit(".", 1)[-1].lower()
         contract_tmp_path = None
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            suffix = f".{contract_ext}" if contract_ext in ("pdf", "docx") else ".docx"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(contract_bytes)
                 contract_tmp_path = tmp.name
-            # ออกจาก with block — ไฟล์ปิดแล้ว Windows ให้ลบได้
-            contract_text = smart_docx_extract(contract_tmp_path)
+
+            if contract_ext == "pdf":
+                # PDF → OCR ด้วย Gemini (เหมือน Quotation)
+                logger.info("[ SMART PARSER ] Contract เป็น PDF → ใช้ OCR")
+                contract_text = await _ocr_from_bytes(contract_bytes, contract.filename, CONTRACT_OCR_PROMPT, client)
+            else:
+                # DOCX → python-docx
+                logger.info("[ SMART PARSER ] Contract เป็น DOCX → ใช้ python-docx")
+                contract_text = smart_docx_extract(contract_tmp_path)
         finally:
             if contract_tmp_path and os.path.exists(contract_tmp_path):
                 os.remove(contract_tmp_path)
@@ -1125,7 +1173,10 @@ async def recheck(
         # ── คำนวณวันจริงด้วย Python แล้ว inject card เข้า document_comparison ──
         cp          = result_one.get("contract_period") or {}
         period_card = build_period_card(cp)
-        doc_cmp     = [period_card] + result_one.get("document_comparison", [])
+        doc_cmp     = (
+            ([period_card] if period_card is not None else [])
+            + result_one.get("document_comparison", [])
+        )
 
         result = {
             "summary":                       result_one.get("summary", {}),
@@ -1176,5 +1227,6 @@ async def recheck(
         return result
 
     except Exception as e:
-        logger.error(f"SYSTEM ERROR: {e}")
-        return {"error": "Internal server error"}
+        import traceback
+        logger.error(f"SYSTEM ERROR: {e}\n{traceback.format_exc()}")
+        return {"error": str(e)}
