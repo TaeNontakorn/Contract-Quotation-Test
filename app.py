@@ -11,7 +11,6 @@ st.set_page_config(
 
 API_URL = "https://contract-quotation-test.onrender.com/recheck"
 HISTORY_URL = "https://contract-quotation-test.onrender.com/history"
-
 # =========================
 # Custom CSS
 # =========================

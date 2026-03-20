@@ -14,10 +14,13 @@ from google import genai
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
+import pandas as pd
+import magic
 
 from pymongo import MongoClient
 
 from docx import Document
+
 
 
 # =========================================================
@@ -41,7 +44,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 def get_api_key(form_key: str = "") -> str:
     """ใช้ key จาก form ถ้ามี ไม่งั้น fallback ไป env"""
@@ -102,6 +104,7 @@ def _sanitize_json_string_values(text: str) -> str:
 
 
 def safe_json_load(text: str):
+    """Fallback parser — ใช้เฉพาะกรณีที่ structured output ไม่ได้เปิดใช้งาน"""
     if not text:
         logger.error("Empty LLM response")
         return {}
@@ -115,13 +118,8 @@ def safe_json_load(text: str):
     if match:
         text = match.group(0)
 
-    # ลบ control characters (ยกเว้น \n \r \t)
     text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
-
-    # escape literal newline/tab ที่อยู่ใน JSON string value
     text = _sanitize_json_string_values(text)
-
-    # ลบ trailing comma ก่อน } หรือ ]
     text = re.sub(r',(\s*[}\]])', r'\1', text)
 
     try:
@@ -424,49 +422,32 @@ CONTRACT_OCR_PROMPT = """
 """
 
 
+def _ocr_inline_sync(file_bytes: bytes, prompt: str, client: genai.Client) -> str:
+    """
+    OCR แบบ inline_data — ไม่ต้อง upload ไฟล์ขึ้น Gemini server
+    เร็วกว่า file upload โดยเฉพาะไฟล์เล็ก-กลาง (<20MB)
+    """
+    import base64
+    b64 = base64.b64encode(file_bytes).decode()
+    response = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=[
+            {"inline_data": {"mime_type": "application/pdf", "data": b64}},
+            prompt,
+        ],
+    )
+    return response.text.strip()
+
+
 async def run_ocr(upload: UploadFile, prompt: str, client: genai.Client) -> str:
+    """OCR ไฟล์ที่ upload เข้ามา — ใช้ inline_data (ไม่ต้อง upload แยก)"""
     file_bytes = await upload.read()
-    tmp_path = None
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    # ออกจาก with block — ไฟล์ปิดแล้ว Windows ให้ลบได้
-
-    try:
-        uploaded_file = await asyncio.to_thread(client.files.upload, file=tmp_path)
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model="gemini-2.5-flash",
-            contents=[uploaded_file, prompt],
-        )
-        return response.text.strip()
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    return await asyncio.to_thread(_ocr_inline_sync, file_bytes, prompt, client)
 
 
 async def _ocr_from_bytes(file_bytes: bytes, filename: str, prompt: str, client: genai.Client) -> str:
-    """
-    OCR จาก bytes โดยตรง — ใช้สำหรับ Smart File Parser
-    เมื่อไฟล์ contract เป็น PDF ให้ส่ง bytes เข้ามาแทน UploadFile
-    """
-    ext = (filename or "").rsplit(".", 1)[-1].lower() or "pdf"
-    tmp_path = None
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    try:
-        uploaded_file = await asyncio.to_thread(client.files.upload, file=tmp_path)
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model="gemini-2.5-flash",
-            contents=[uploaded_file, prompt],
-        )
-        return response.text.strip()
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    """OCR จาก bytes โดยตรง — ใช้สำหรับ Smart File Parser (contract PDF)"""
+    return await asyncio.to_thread(_ocr_inline_sync, file_bytes, prompt, client)
 
 
 # =========================================================
@@ -815,159 +796,165 @@ class DBDParser:
 
 
 # =========================================================
-# LLM COMPARE
+# LLM COMPARE — แยกเป็น 3 functions อิสระ (parallel + focused)
 # =========================================================
 
-def compare_documents(
-    quotation_text: str,
+_GEMINI_CONFIG = {"temperature": 0}  # stable, ไม่สุ่ม
+
+
+def _gemini_json(client: genai.Client, prompt: str) -> dict:
+    """Helper: เรียก Gemini และ parse JSON — ใช้ร่วมกันทั้ง 3 functions"""
+    response = client.models.generate_content(
+        model="gemini-2.5-pro",
+        contents=prompt,
+        config=_GEMINI_CONFIG,
+    )
+    return safe_json_load(response.text)
+
+
+# ------------------------------------------------------------------
+# FUNCTION 1: ตรวจสอบ DBD vs สัญญา
+# ------------------------------------------------------------------
+def check_dbd_validation(
     contract_text: str,
     dbd_data: dict,
     client: genai.Client,
-) -> dict:
-
+) -> list:
+    """
+    ตรวจสอบเฉพาะ DBD กับสัญญา — ไม่รู้จัก Quotation เลย
+    ทำให้ model focus 100% กับงานนี้
+    """
     prompt = f"""
-คุณคือ AI สำหรับการตรวจสอบเอกสารทางกฎหมายและเชิงพาณิชย์
-เชี่ยวชาญด้าน:
-- การเปรียบเทียบเอกสาร
-- การวิเคราะห์เชิงความหมาย
-- การตรวจจับความผิดพลาดจาก OCR
-- การตรวจสอบความสอดคล้องกับข้อมูลราชการ (DBD)
-
-คุณต้องวิเคราะห์ 3 ส่วนแยกจากกันอย่างเด็ดขาด
-ห้ามนำผลของแต่ละส่วนมาปะปนกัน
+คุณคือผู้เชี่ยวชาญด้านกฎหมายนิติบุคคลไทย
+งานของคุณ: ตรวจสอบว่าข้อมูลในสัญญาสอดคล้องกับข้อมูลจดทะเบียนบริษัท (DBD) หรือไม่
 
 ====================================================
-ส่วนที่ 1: ตรวจสอบกับข้อมูล DBD (ตรวจสอบทางกฎหมาย)
+ข้อมูล DBD (ข้อมูลอ้างอิงสูงสุด — ถือเป็นความจริง)
 ====================================================
-
-ข้อมูล DBD (ข้อมูลอ้างอิงสูงสุด):
 - เลขทะเบียนนิติบุคคล: {dbd_data.get("registration_number")}
 - ที่อยู่ตามทะเบียน: {dbd_data.get("address")}
 - รายชื่อกรรมการ: {dbd_data.get("committee")}
 - ผู้มีอำนาจลงนาม: {dbd_data.get("authorized_signatory")}
 
-กฎการตรวจสอบเพิ่มเติมเพื่อความแม่นยำ:
-1. การตรวจสอบ "ความหมายเหมือนกัน": 
-   - ให้วิเคราะห์ "ผลลัพธ์ทางกฎหมาย" (Legal Effect) ว่าใครสามารถเซ็นได้บ้าง และต้องเซ็นกี่คน
-   - หาก DBD ระบุเงื่อนไข "พร้อมประทับตราสำคัญ" แต่ในสัญญาไม่ได้ระบุเรื่องตราประทับ ให้ถือเป็น "ข้อมูลขาดในสัญญา"
-2. การวิเคราะห์ "ขอบเขตอำนาจ":
-   - หากในสัญญาระบุชื่อกรรมการครบ แต่มีการ "จำกัดเรื่อง" (เช่น เซ็นได้เฉพาะเรื่องการเงิน) ในขณะที่ DBD ไม่ได้จำกัด ให้ถือเป็น "ข้อมูลไม่ตรงกับ DBD"
-3. การจัดการ "dbd_reference":
-   - ต้องคัดลอกข้อความจาก DBD มาวางแบบ Word-for-Word เพื่อใช้เป็นหลักฐานอ้างอิงเสมอ
+====================================================
+กฎการตรวจสอบ
+====================================================
+1. "ความหมายเหมือนกัน":
+   - วิเคราะห์ผลลัพธ์ทางกฎหมาย (Legal Effect) ว่าใครเซ็นได้บ้าง และต้องเซ็นกี่คน
+   - DBD ระบุ "พร้อมประทับตราสำคัญ" แต่สัญญาไม่ระบุ → "ข้อมูลขาดในสัญญา"
+2. "ขอบเขตอำนาจ":
+   - สัญญาระบุชื่อกรรมการครบแต่จำกัดเรื่อง ขณะที่ DBD ไม่ได้จำกัด → "ข้อมูลไม่ตรงกับ DBD"
+3. dbd_reference: ต้องคัดลอกข้อความจาก DBD แบบ Word-for-Word เสมอ
 4. ผู้มีอำนาจลงนาม:
-    - หาก DBD ระบุ "ผู้มีอำนาจลงนาม" เป็นชื่อบุคคล แต่ในสัญญาระบุเป็นตำแหน่ง ให้ถือเป็น "ถ้อยคำต่างแต่ความหมายเหมือนกัน" ถ้าความสามารถในการลงนามตรงกัน
-    - หาก DBD ระบุ "ผู้มีอำนาจลงนาม" 2 คน แต่ในสัญญาระบุได้แค่ 1 คน ให้ถือเป็น "ข้อมูลขาดในสัญญา"
-    - หาก DBD ระบุ "ผู้มีอำนาจลงนาม" 2 คน แต่ในสัญญาระบุเป็น "กรรมการบริษัท" โดยไม่ระบุชื่อเลย ให้ถือเป็น "ถ้อยคำต่างแต่ความหมายเหมือนกัน" ถ้าความสามารถในการลงนามตรงกัน
-    - หาก DBD ระบุ "ผู้มีอำนาจลงนาม" 5 คน และบอกว่า "ลงนามได้พร้อมกันอย่างน้อย 2 คน" แต่ในสัญญาระบุได้แค่ 1 คน หรือระบุเป็น "กรรมการบริษัท" โดยไม่ระบุจำนวนคนเลย ให้ถือเป็น "ข้อมูลขาดในสัญญา"
-   
-====================================================
-ส่วนที่ 2: เปรียบเทียบ ใบเสนอราคา กับ สัญญา
-====================================================
-
-กฎหลัก:
-- ใบเสนอราคา คือข้อมูลเชิงพาณิชย์ที่ถูกต้องที่สุด
-- เปรียบเทียบเฉพาะ Quotation กับ Contract
-- ห้ามใช้ DBD ในส่วนนี้
-- ห้ามระบุเลขหน้าของใบเสนอราคาในผลลัพธ์ — ใน quotation_text ให้คัดลอกข้อความที่เกี่ยวข้องโดยตรง ไม่ต้องบอกว่ามาจากหน้าไหน
-- ไม่ต้องตรวจจับ หัก % ณ ที่จ่าย
-
-ให้ตรวจสอบ:
-- ข้อมูลที่หายไป / ค่าที่แตกต่างกัน / ความแตกต่างเชิงความหมาย
-- การสะกดผิด / OCR ผิด
-- ตัวเลข / วันที่ / จำนวนผู้ใช้ / ราคา
-
-ฟิลด์ที่ต้องตรวจสอบเป็นพิเศษ:
-
-[กำหนดระยะเวลา]
-- ดึงวันที่เริ่มต้นและสิ้นสุดสัญญาจากทั้งใบเสนอราคาและสัญญา แล้วใส่ใน contract_period ของ JSON output
-- ห้ามคำนวณจำนวนวันหรือตัดสินว่าครบปีหรือไม่ — ให้ดึงแค่วันที่ดิบจากเอกสารเท่านั้น
-- ใน quotation_text และ contract_text ให้แสดงวันที่แยกชัดเจนดังนี้:
-  วันเริ่มต้น: DD/MM/YYYY
-  วันสิ้นสุด: DD/MM/YYYY
-  (ถ้าไม่พบให้ระบุ "ไม่พบ")
-
-[การชำระเงินและขอบเขต]
-- field = "Mango Anywhere Software - ยอดรวม" : ตรวจยอด Total Amount ทุกจุดให้ตรงกัน
-- field = "ค่าสิทธิ (Royalty Fee)" : ตรวจเงื่อนไขการชำระแยกตามรายการ
-- field = "เงินมัดจำ/เงินประกัน" : ตรวจยอดให้ตรงตามข้อตกลง
-
-[การตรวจก่อน vat % และหลัง vat %]
-- ตรวจสอบว่ามีการระบุว่า "รวม VAT แล้ว" หรือ "ยังไม่รวม VAT" ให้ตรงกันในทุกจุดที่มีการพูดถึงราคา
-- ตรวจสอบยอดเงินที่ระบุชัดเจนว่าเป็น VAT amount (ถ้ามี) ว่าตรงกับยอดที่คำนวณจาก % VAT ที่ระบุหรือไม่
-- ถ้าการตรวจต้องมีก่อน vat และหลัง vat ให้ตรวจสอบว่ามีการระบุอย่างชัดเจนว่าเป็นยอดก่อน vat หรือหลัง vat และยอดต้องตรงกัน
-
-
-[สิทธิการใช้งาน / จำนวนผู้ใช้]
-- field = "User License / จำนวนผู้ใช้งาน"
-- ให้ค้นหาทุกคำที่อาจหมายถึงจำนวนผู้ใช้: "user", "users", "ผู้ใช้งาน", "license", "seat", "account", "named user", "concurrent user", "จำนวนผู้ใช้", "สิทธิ์การใช้งาน"
-- เปรียบเทียบตัวเลขจำนวนผู้ใช้ให้ตรงกันทั้งสองเอกสาร
-- ระบุให้ชัดว่าเป็น "จำกัดจำนวน X คน" หรือ "ไม่จำกัด (Unlimited)"
-- ถ้าใบเสนอราคาระบุจำนวน แต่สัญญาไม่ระบุ หรือระบุไม่ตรงกัน ให้รายงานทันที severity = "สูง"
-
-[การบอกเลิกสัญญา]
-- ตรวจสอบเงื่อนไขการบอกเลิกสัญญาทั้งสองฝ่าย (ใบเสนอราคา vs สัญญา)
-- ตรวจสอบ: ระยะเวลาแจ้งล่วงหน้า (Notice Period) / เหตุผลที่สามารถบอกเลิกได้ / ผลกระทบหลังบอกเลิก (การคืนเงิน ค่าปรับ ฯลฯ)
-- ถ้าใบเสนอราคามีข้อกำหนดการบอกเลิก แต่สัญญาไม่มีหรือแตกต่างกัน ให้รายงานเป็น "ข้อมูลขาดในสัญญา" หรือ "แตกต่างอย่างมีนัยสำคัญ"
-- field = "การบอกเลิกสัญญา"
-
-[ITAP]
-- ถ้าข้อมูลเข้าร่วมโครงการ ITAP โดย สวทช. สนับสนุน 50% (ไม่เกิน / 150,000 บาท) ของค่าขึ้นระบบ (implement) / โดยลูกค้าสำรองจ่ายก่อน / และเบิกคืนหลังจากระบบขึ้นใช้งานเรียบร้อยแล้ว หายไปจากสัญญา ไม่ต้องเตือน
-
-[สัญญาฉบับนี้ทำขึ้นเพื่อ]
--  สัญญาฉบับนี้ทำขึ้นที่ ... เมื่อวันที่................................. ไม่ต้องเตือน
-
-[ที่พักอาศัยและค่าเดินทาง]
-- เงื่อนไขการรับผิดชอบค่าเดินทางและที่พักแตกต่างกัน หน้า 5 Item 8: เงื่อนไขค่าเดินทางและที่พัก สำหรับงานที่ต้องเดินทางไปปฏิบัติงานนอกสถานที่ ซึ่งมีระยะทางไป-กลับ เกิน 80 กิโลเมตรจากที่ตั้งบริษัท ลูกค้าจะเป็นผู้รับผิดชอบค่าใช้จ่ายในการเดินทางและที่พักสำหรับทีมงาน ถ้าไม่เหมือนกับ กรณีผู้รับอนุญาตมีสถานที่ตั้งสำนักงานใหญ่ หรือ สาขาอยู่นอกเขตจังหวัดกรุงเทพมหานครและปริมณฑลใกล้เคียง ได้แก่ จังหวัดนนทบุรี ,จังหวัดสมุทรปราการ และ จังหวัดปทุมธานี ผู้รับอนุญาตตกลงรับผิดชอบค่าเดินทางและค่าที่พักให้กับพนักงานของผู้อนุญาตทั้งหมด
-  ไม่ต้องแจ้งเตือนแต่ข้อความที่ให้มานั้นต้องให้บริบทและเงื่อนไขนี้เท่านั้น
-  
-ประเภทที่ต้องใช้:
-- "อาจเป็นการสะกดผิด"
-- "ถ้อยคำต่างแต่ความหมายเหมือนกัน"
-- "แตกต่างเล็กน้อย"
-- "แตกต่างอย่างมีนัยสำคัญ"
-- "ข้อมูลขาดในสัญญา"
-- "ข้อมูลขาดทั้งสองฝ่าย"
-
-====================================================
-ส่วนที่ 3: ตรวจสอบความสอดคล้องภายในสัญญา
-====================================================
-
-กฎหลัก:
-- ตรวจสอบเฉพาะภายใน "สัญญา" เท่านั้น
-- ห้ามใช้ Quotation และ DBD ในส่วนนี้
-- ตรวจสอบความสอดคล้องของข้อมูลที่ควรจะเหมือนกันภายในสัญญา
-- ตรวจสอบตัวสะกดว่ามีการสะกดผิดหรือไม่ — หากพบคำผิดซ้ำในหลายจุด ให้รายงานแยกทุกจุดที่ปรากฏ
-- ตรวจสอบเลขข้อว่ามีการเรียงกันถูกต้องหรือไม่
-
-
-
-กฎการตรวจวันที่:
-- วันที่ในการเริ่มสัญญาต้องตรงกันทั้งหมดโดยที่อิงจากบริบทที่เกี่ยวข้องว่าสามารถเป็นวันเริ่มต้นสัญญาได้ เช่น "วันที่เริ่มต้นสัญญา", "Effective Date", "วันที่มีผลบังคับใช้" เป็นต้น
-- วันที่ในการสิ้นสุดสัญญาต้องตรงกันทั้งหมดโดยที่อิงจากบริบทที่เกี่ยวข้องว่าสามารถเป็นวันสิ้นสุดสัญญาได้ เช่น "วันที่สิ้นสุดสัญญา", "Expiration Date", "วันที่หมดอายุ" เป็นต้น
-- ถ้าเจอ "สัญญาฉบับนี้ทำขึ้นที่ บริษัท แมงโก้ คอนซัลแตนท์ จำกัด (สำนักงานใหญ่) เมื่อวันที่................................." ไม่ต้องแจ้งเตือน
-
-กฎการตรวจคำผิด:
-- หากพบคำที่สะกดผิดในสัญญา ให้ตรวจสอบว่าคำๆ นั้นปรากฏกี่ครั้ง ในสัญญาและหน้าไหนบ้าง และมีให้ ครอบข้อความนั้นด้วย <strong style="color: red;">...</strong>
-- หากคำๆ นั้นปรากฏหลายครั้งในสัญญา ให้รายงานทุกจุดที่ปรากฏ โดยใช้ประเภท = "อาจเป็นการสะกดผิด" และ field = "คำที่อาจสะกดผิด"
-- ถ้าเจอคำที่สะกดผิดให้เขียนเส้นใต้คำที่ผิดในสัญญา และอธิบายว่าคำที่ถูกต้องควรเป็นคำว่าอะไร และมีความหมายอย่างไรในบริบทของสัญญา
-
-กฏการตรวจพยาน
-- ถ้ามีการต้องเซ็นเป็นพยานแล้วไม่ได้ระบุชื่อพยาน ไม่ต้องแสดง
+   - DBD ระบุชื่อบุคคล / สัญญาระบุตำแหน่ง → "ถ้อยคำต่างแต่ความหมายเหมือนกัน" (ถ้าความสามารถลงนามตรงกัน)
+   - DBD ระบุ 2 คน / สัญญาระบุ 1 คน → "ข้อมูลขาดในสัญญา"
+   - DBD ระบุ 2 คน / สัญญาระบุ "กรรมการบริษัท" ไม่ระบุชื่อ → "ถ้อยคำต่างแต่ความหมายเหมือนกัน"
+   - DBD ระบุ 5 คน อย่างน้อย 2 คน / สัญญาระบุ 1 คนหรือไม่ระบุจำนวน → "ข้อมูลขาดในสัญญา"
 
 ====================================================
 กฎสำคัญสูงสุด
 ====================================================
 - ห้ามคาดเดาข้อมูลที่ไม่มี
-- ห้ามสร้างข้อมูลใหม่
-- หากไม่พบข้อมูล ให้ระบุว่าไม่พบ
-- ตอบเป็น JSON เท่านั้น
-- ห้ามเติมคำอธิบายหรือความคิดเห็นใด ๆ นอกเหนือจากที่ขอมาข้างต้น
-- หากไม่แน่ใจ ให้ใช้ความระมัดระวังและรายงานเป็น "อาจเป็นการสะกดผิด" หรือ "ข้อมูลขาดในสัญญา" แทนการคาดเดา
+- ตอบเป็น JSON array เท่านั้น ไม่มี key ห่อนอก
+- ถ้าไม่พบความผิดปกติใดเลย ให้ตอบ []
+
+====================================================
+ข้อมูลนำเข้า — สัญญา
+====================================================
+<<<
+{contract_text}
+>>>
+
+====================================================
+รูปแบบผลลัพธ์ (JSON array เท่านั้น)
+====================================================
+[
+  {{
+    "title": "ประโยคสรุปสั้นๆ เช่น 'ที่อยู่ในสัญญาไม่ตรงกับ DBD'",
+    "field": "เลขทะเบียนนิติบุคคล | ที่อยู่ตามทะเบียน | รายชื่อกรรมการ | ผู้มีอำนาจลงนาม",
+    "type": "ข้อมูลไม่ตรงกับ DBD | ข้อมูลขาดในสัญญา | ถ้อยคำต่างแต่ความหมายเหมือนกัน",
+    "contract_text": "...",
+    "dbd_reference": "...",
+    "explanation": "อธิบายเป็นภาษาไทย โดยอ้างอิง DBD",
+    "severity": "ต่ำ | ปานกลาง | สูง",
+    "confidence": 0.0
+  }}
+]
+"""
+    result = _gemini_json(client, prompt)
+    return result if isinstance(result, list) else []
+
+
+# ------------------------------------------------------------------
+# FUNCTION 2: เปรียบเทียบ Quotation vs Contract + ดึงวันที่
+# ------------------------------------------------------------------
+def check_document_comparison(
+    quotation_text: str,
+    contract_text: str,
+    client: genai.Client,
+) -> dict:
+    """
+    เปรียบเทียบ Quotation กับ Contract — ไม่รู้จัก DBD เลย
+    คืนค่า: { "contract_period": {...}, "document_comparison": [...] }
+    """
+    prompt = f"""
+คุณคือผู้เชี่ยวชาญด้านเอกสารพาณิชย์และสัญญาซอฟต์แวร์
+งานของคุณ: เปรียบเทียบใบเสนอราคา (Quotation) กับสัญญา (Contract) เพื่อหาความไม่สอดคล้อง
+
+====================================================
+กฎหลัก
+====================================================
+- ใบเสนอราคา คือข้อมูลเชิงพาณิชย์ที่ถูกต้องที่สุด — ใช้เป็น reference
+- ห้ามใช้ DBD หรืออ้างอิงข้อมูลนอกเอกสารทั้งสอง
+- ห้ามระบุเลขหน้าของใบเสนอราคาในผลลัพธ์
+- ไม่ต้องตรวจจับ หัก % ณ ที่จ่าย
+
+====================================================
+ฟิลด์ที่ต้องตรวจสอบ
+====================================================
+
+[กำหนดระยะเวลา]
+- ดึงวันที่เริ่มต้นและสิ้นสุดจากทั้งสองเอกสาร → ใส่ใน contract_period
+- ห้ามคำนวณจำนวนวัน — ดึงแค่วันที่ดิบ
+- รูปแบบ: DD/MM/YYYY หรือ null ถ้าไม่พบ
+
+[การชำระเงินและขอบเขต]
+- "Mango Anywhere Software - ยอดรวม": ตรวจยอด Total Amount ทุกจุด
+- "ค่าสิทธิ (Royalty Fee)": ตรวจเงื่อนไขการชำระแยกตามรายการ
+- "เงินมัดจำ/เงินประกัน": ตรวจยอดให้ตรงตามข้อตกลง
+
+[VAT]
+- ตรวจว่า "รวม VAT แล้ว" หรือ "ยังไม่รวม VAT" ตรงกันทุกจุดที่มีราคา
+- ตรวจยอด VAT amount ว่าตรงกับ % ที่ระบุหรือไม่
+
+[สิทธิการใช้งาน / จำนวนผู้ใช้]
+- field = "User License / จำนวนผู้ใช้งาน"
+- ค้นหาทุกคำ: "user", "users", "ผู้ใช้งาน", "license", "seat", "account", "named user", "concurrent user", "จำนวนผู้ใช้", "สิทธิ์การใช้งาน"
+- ถ้า Quotation ระบุจำนวนแต่ Contract ไม่ระบุหรือไม่ตรงกัน → severity = "สูง"
+
+[การบอกเลิกสัญญา]
+- field = "การบอกเลิกสัญญา"
+- ตรวจ: Notice Period / เหตุผลบอกเลิก / ผลกระทบ (คืนเงิน, ค่าปรับ)
+- Quotation มีแต่ Contract ไม่มีหรือต่างกัน → "ข้อมูลขาดในสัญญา" หรือ "แตกต่างอย่างมีนัยสำคัญ"
+
+[ข้อยกเว้น — ไม่ต้องรายงาน]
+- ITAP (สวทช. สนับสนุน 50%, ไม่เกิน 150,000 บาท) หายจากสัญญา
+- "สัญญาฉบับนี้ทำขึ้นที่ ... เมื่อวันที่..."
+- ค่าเดินทาง/ที่พัก (>80 กม. หรือนอกกรุงเทพฯ ปริมณฑล)
+
+ประเภทที่ต้องใช้:
+"อาจเป็นการสะกดผิด" | "ถ้อยคำต่างแต่ความหมายเหมือนกัน" | "แตกต่างเล็กน้อย" |
+"แตกต่างอย่างมีนัยสำคัญ" | "ข้อมูลขาดในสัญญา" | "ข้อมูลขาดทั้งสองฝ่าย"
+
+====================================================
+กฎสำคัญสูงสุด
+====================================================
+- ห้ามคาดเดาข้อมูลที่ไม่มี
+- ตอบเป็น JSON object เท่านั้น
 
 ====================================================
 ข้อมูลนำเข้า
 ====================================================
-
 ใบเสนอราคา:
 <<<
 {quotation_text}
@@ -979,72 +966,146 @@ def compare_documents(
 >>>
 
 ====================================================
-รูปแบบผลลัพธ์ (JSON เท่านั้น)
+รูปแบบผลลัพธ์ (JSON object เท่านั้น)
 ====================================================
-
 {{
-  "summary": {{
-      "overall_risk": "ต่ำ | ปานกลาง | สูง"
-  }},
   "contract_period": {{
-      "quotation_start": "วันที่เริ่มต้นจากใบเสนอราคา รูปแบบ DD/MM/YYYY หรือ null ถ้าไม่พบ",
-      "quotation_end":   "วันที่สิ้นสุดจากใบเสนอราคา รูปแบบ DD/MM/YYYY หรือ null ถ้าไม่พบ",
-      "contract_start":  "วันที่เริ่มต้นจากสัญญา รูปแบบ DD/MM/YYYY หรือ null ถ้าไม่พบ",
-      "contract_end":    "วันที่สิ้นสุดจากสัญญา รูปแบบ DD/MM/YYYY หรือ null ถ้าไม่พบ"
+    "quotation_start": "DD/MM/YYYY หรือ null",
+    "quotation_end":   "DD/MM/YYYY หรือ null",
+    "contract_start":  "DD/MM/YYYY หรือ null",
+    "contract_end":    "DD/MM/YYYY หรือ null"
   }},
-  "dbd_validation": [
-      {{
-          "title": "ประโยคสรุปสั้นๆ ที่บอกว่า field อะไร มีปัญหาอะไร เช่น 'ที่อยู่ในสัญญาไม่ตรงกับ DBD'",
-          "field": "เลขทะเบียนนิติบุคคล | ที่อยู่ตามทะเบียน | รายชื่อกรรมการ | ผู้มีอำนาจลงนาม",
-          "type": "ข้อมูลไม่ตรงกับ DBD | ข้อมูลขาดในสัญญา | ถ้อยคำต่างแต่ความหมายเหมือนกัน",
-          "contract_text": "...",
-          "dbd_reference": "...",
-          "explanation": "อธิบายเป็นภาษาไทย โดยอ้างอิง DBD เข้าใจได้ง่าย",
-          "severity": "ต่ำ | ปานกลาง | สูง",
-          "confidence": 0.0
-      }}
-  ],
   "document_comparison": [
-      {{
-          "title": "ประโยคสรุปสั้นๆ ที่บอกว่า field อะไร มีปัญหาอะไร เช่น 'จำนวน User License ในสัญญาไม่ตรงกับใบเสนอราคา'",
-          "field": "ชื่อบริษัท | ราคา | จำนวนผู้ใช้งาน | วันที่ | หน้าที่ความรับผิดชอบ | อื่น ๆ",
-          "type": "อาจเป็นการสะกดผิด | ถ้อยคำต่างแต่ความหมายเหมือนกัน | แตกต่างเล็กน้อย | แตกต่างอย่างมีนัยสำคัญ | ข้อมูลขาดในสัญญา | ข้อมูลขาดทั้งสองฝ่าย",
-          "quotation_text": "ข้อความจากใบเสนอราคาที่เกี่ยวข้อง (ไม่ต้องระบุเลขหน้า)",
-          "contract_text": "ข้อที่ N ...",
-          "explanation": "อธิบายเป็นภาษาไทย โดยอ้างอิงข้อความในเอกสารเข้าใจได้ง่าย",
-          "severity": "ต่ำ | ปานกลาง | สูง",
-          "confidence": 0.0
-      }}
-  ],
-  "contract_internal_consistency": [
-      {{
-          "title": "ประโยคสรุปสั้นๆ ที่บอกว่า field อะไร มีปัญหาอะไร เช่น 'วันที่ในข้อ 1.1 ไม่ตรงกับวันที่ในข้อ 5.2'",
-          "field": "เนื้อหาในสัญญา | วันที่ | เลขข้อ | อื่นๆ",
-          "type": "แตกต่างอย่างมีนัยสำคัญ | อาจเป็นการสะกดผิด | เลขข้อไม่เรียงกัน | วันที่ไม่ตรงกัน | ข้อมูลขาดในสัญญา",
-          "contract_text": "ข้อที่ N ...",
-          "explanation": "อธิบายเป็นภาษาไทย โดยอ้างอิงข้อความในสัญญาเข้าใจได้ง่าย",
-          "severity": "ต่ำ | ปานกลาง | สูง",
-          "confidence": 0.0
-      }}
+    {{
+      "title": "ประโยคสรุปสั้นๆ เช่น 'จำนวน User License ในสัญญาไม่ตรงกับใบเสนอราคา'",
+      "field": "ชื่อบริษัท | ราคา | จำนวนผู้ใช้งาน | วันที่ | หน้าที่ความรับผิดชอบ | อื่น ๆ",
+      "type": "อาจเป็นการสะกดผิด | ถ้อยคำต่างแต่ความหมายเหมือนกัน | แตกต่างเล็กน้อย | แตกต่างอย่างมีนัยสำคัญ | ข้อมูลขาดในสัญญา | ข้อมูลขาดทั้งสองฝ่าย",
+      "quotation_text": "ข้อความจากใบเสนอราคาที่เกี่ยวข้อง",
+      "contract_text": "ข้อที่ N ...",
+      "explanation": "อธิบายเป็นภาษาไทย",
+      "severity": "ต่ำ | ปานกลาง | สูง",
+      "confidence": 0.0
+    }}
   ]
 }}
 """
+    result = _gemini_json(client, prompt)
+    return result if isinstance(result, dict) else {}
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config={"temperature": 0},  # temperature=0 → ผลลัพธ์ stable ไม่สุ่ม
+
+# ------------------------------------------------------------------
+# FUNCTION 3: ตรวจความสอดคล้องภายในสัญญา
+# ------------------------------------------------------------------
+def check_internal_consistency(
+    contract_text: str,
+    client: genai.Client,
+) -> list:
+    """
+    ตรวจสอบเฉพาะภายในสัญญา — ไม่รู้จัก Quotation และ DBD เลย
+    คืนค่า: list ของ issues
+    """
+    prompt = f"""
+คุณคือผู้เชี่ยวชาญด้านการตรวจทานสัญญา (Contract Proofreader)
+งานของคุณ: ตรวจสอบความสอดคล้องและความถูกต้องภายในสัญญาฉบับเดียว
+
+====================================================
+สิ่งที่ต้องตรวจสอบ
+====================================================
+1. ความสอดคล้องของข้อมูลที่ควรเหมือนกันตลอดทั้งสัญญา
+2. การสะกดผิด — ถ้าพบคำผิดซ้ำหลายจุด ให้รายงานแยกทุกจุด
+3. เลขข้อ — ตรวจว่าเรียงลำดับถูกต้อง
+
+กฎการตรวจวันที่:
+- วันที่เริ่มสัญญาต้องตรงกันทั้งหมดในทุกข้อที่อ้างอิง (เช่น "Effective Date", "วันที่มีผลบังคับใช้")
+- วันที่สิ้นสุดสัญญาต้องตรงกันทั้งหมดในทุกข้อที่อ้างอิง (เช่น "Expiration Date", "วันที่หมดอายุ")
+- ข้อยกเว้น: "สัญญาฉบับนี้ทำขึ้นที่ บริษัท แมงโก้ คอนซัลแตนท์ จำกัด เมื่อวันที่..." ไม่ต้องแจ้งเตือน
+
+กฎการตรวจคำผิด:
+- ถ้าพบคำสะกดผิด ให้ครอบด้วย <strong style="color: red;">คำผิด</strong>
+- ใช้ type = "อาจเป็นการสะกดผิด", field = "คำที่อาจสะกดผิด"
+- อธิบายคำที่ถูกต้องและความหมายในบริบทสัญญา
+
+กฎการตรวจพยาน:
+- ถ้าต้องเซ็นเป็นพยานแต่ไม่ระบุชื่อ ไม่ต้องแสดง
+
+====================================================
+กฎสำคัญสูงสุด
+====================================================
+- ตรวจสอบเฉพาะภายในสัญญา — ห้ามอ้างอิงเอกสารอื่น
+- ห้ามคาดเดาข้อมูลที่ไม่มี
+- ตอบเป็น JSON array เท่านั้น
+- ถ้าไม่พบความผิดปกติใดเลย ให้ตอบ []
+
+====================================================
+ข้อมูลนำเข้า — สัญญา
+====================================================
+<<<
+{contract_text}
+>>>
+
+====================================================
+รูปแบบผลลัพธ์ (JSON array เท่านั้น)
+====================================================
+[
+  {{
+    "title": "ประโยคสรุปสั้นๆ เช่น 'วันที่ในข้อ 1.1 ไม่ตรงกับวันที่ในข้อ 5.2'",
+    "field": "เนื้อหาในสัญญา | วันที่ | เลขข้อ | คำที่อาจสะกดผิด | อื่นๆ",
+    "type": "แตกต่างอย่างมีนัยสำคัญ | อาจเป็นการสะกดผิด | เลขข้อไม่เรียงกัน | วันที่ไม่ตรงกัน | ข้อมูลขาดในสัญญา",
+    "contract_text": "ข้อที่ N ...",
+    "explanation": "อธิบายเป็นภาษาไทย",
+    "severity": "ต่ำ | ปานกลาง | สูง",
+    "confidence": 0.0
+  }}
+]
+"""
+    result = _gemini_json(client, prompt)
+    return result if isinstance(result, list) else []
+
+
+# ------------------------------------------------------------------
+# ORCHESTRATOR: รัน 3 functions แบบ parallel แล้วรวมผล
+# ------------------------------------------------------------------
+async def compare_documents_parallel(
+    quotation_text: str,
+    contract_text: str,
+    dbd_data: dict,
+    client: genai.Client,
+) -> dict:
+    """
+    รัน check_dbd_validation, check_document_comparison, check_internal_consistency
+    พร้อมกัน (parallel) ด้วย asyncio.gather
+    เร็วขึ้น ~2-3x เทียบกับ sequential และแม่นขึ้นเพราะแต่ละ call มี focused prompt
+    """
+    logger.info("[ LLM ] เริ่ม 3 parallel checks...")
+
+    dbd_task      = asyncio.to_thread(check_dbd_validation,       contract_text, dbd_data, client)
+    doc_task      = asyncio.to_thread(check_document_comparison,   quotation_text, contract_text, client)
+    internal_task = asyncio.to_thread(check_internal_consistency,  contract_text, client)
+
+    dbd_issues, doc_result, internal_issues = await asyncio.gather(
+        dbd_task, doc_task, internal_task,
+        return_exceptions=True,
     )
-    result = safe_json_load(response.text)
 
-    if "dbd_validation" in result:
-        result["dbd_validation"] = sort_by_severity(result["dbd_validation"])
-    if "document_comparison" in result:
-        result["document_comparison"] = sort_by_severity(result["document_comparison"])
-    if "contract_internal_consistency" in result:
-        result["contract_internal_consistency"] = sort_by_severity(result["contract_internal_consistency"])
+    # handle exceptions ในแต่ละ branch อย่างอิสระ
+    if isinstance(dbd_issues, Exception):
+        logger.error(f"[ DBD CHECK ERROR ] {dbd_issues}")
+        dbd_issues = []
+    if isinstance(doc_result, Exception):
+        logger.error(f"[ DOC CHECK ERROR ] {doc_result}")
+        doc_result = {}
+    if isinstance(internal_issues, Exception):
+        logger.error(f"[ INTERNAL CHECK ERROR ] {internal_issues}")
+        internal_issues = []
 
-    return result
+    logger.info("[ LLM ] ทั้ง 3 checks เสร็จสิ้น")
+
+    return {
+        "dbd_validation":                dbd_issues,
+        "contract_period":               doc_result.get("contract_period", {}),
+        "document_comparison":           doc_result.get("document_comparison", []),
+        "contract_internal_consistency": internal_issues,
+    }
 
 
 # =========================================================
@@ -1083,129 +1144,179 @@ async def recheck(
     checker_name: str = Form("—"),
     api_key: str = Form(""),
 ):
-    # สร้าง client instance ต่อ request — ไม่ใช้ global state
     key = get_api_key(api_key)
     client = genai.Client(api_key=key)
 
     try:
         # ===============================
-        # STEP 1: OCR / Extract
+        # STEP 1: อ่านไฟล์ทั้งหมดพร้อมกัน
         # ===============================
-        logger.info("[ OCR ] กำลัง OCR ด้วย Gemini...")
+        logger.info("[ READ ] อ่าน bytes ทั้งหมด...")
 
-        quotation_text = ""
+        # อ่าน bytes พร้อมกัน
+        quotation_bytes_list, contract_bytes, dbd_bytes = await asyncio.gather(
+            asyncio.gather(*[f.read() for f in quotation]),
+            contract.read(),
+            dbd_pdf.read(),
+        )
+        contract_ext = (contract.filename or "").rsplit(".", 1)[-1].lower()
 
-        for file in quotation:
-            text = await run_ocr(file, QUOTATION_OCR_PROMPT, client)
-            quotation_text += f"\n--- QUOTATION {file.filename} ---\n"
-            quotation_text += text
+        # ===============================
+        # STEP 2: OCR + DBD parse แบบ parallel
+        # ===============================
+        logger.info("[ PARALLEL ] เริ่ม OCR + DBD parse พร้อมกัน...")
 
-        # ── Smart File Parser: เลือกวิธีอ่านตามนามสกุลไฟล์ ──
-        contract_bytes = await contract.read()
-        contract_ext   = (contract.filename or "").rsplit(".", 1)[-1].lower()
-        contract_tmp_path = None
-        try:
-            suffix = f".{contract_ext}" if contract_ext in ("pdf", "docx") else ".docx"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(contract_bytes)
-                contract_tmp_path = tmp.name
+        # สร้าง OCR tasks สำหรับ quotation ทุกไฟล์
+        async def ocr_quotation_file(idx: int, raw_bytes: bytes, filename: str) -> str:
+            text = await asyncio.to_thread(_ocr_inline_sync, raw_bytes, QUOTATION_OCR_PROMPT, client)
+            return f"\n--- QUOTATION {filename} ---\n{text}"
 
+        quotation_tasks = [
+            ocr_quotation_file(i, raw_bytes, quotation[i].filename)
+            for i, raw_bytes in enumerate(quotation_bytes_list)
+        ]
+
+        # Contract: PDF → OCR inline, DOCX → python-docx (sync)
+        async def extract_contract() -> str:
             if contract_ext == "pdf":
-                # PDF → OCR ด้วย Gemini (เหมือน Quotation)
-                logger.info("[ SMART PARSER ] Contract เป็น PDF → ใช้ OCR")
-                contract_text = await _ocr_from_bytes(contract_bytes, contract.filename, CONTRACT_OCR_PROMPT, client)
+                logger.info("[ SMART PARSER ] Contract เป็น PDF → ใช้ OCR inline")
+                return await asyncio.to_thread(_ocr_inline_sync, contract_bytes, CONTRACT_OCR_PROMPT, client)
             else:
-                # DOCX → python-docx
                 logger.info("[ SMART PARSER ] Contract เป็น DOCX → ใช้ python-docx")
-                contract_text = smart_docx_extract(contract_tmp_path)
-        finally:
-            if contract_tmp_path and os.path.exists(contract_tmp_path):
-                os.remove(contract_tmp_path)
+                suffix = f".{contract_ext}"
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(contract_bytes)
+                        tmp_path = tmp.name
+                    return await asyncio.to_thread(smart_docx_extract, tmp_path)
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
 
-        logger.info("[ OCR ] เสร็จสิ้น")
+        # DBD parse (sync ใน thread)
+        async def parse_dbd_async() -> dict:
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(dbd_bytes)
+                    tmp_path = tmp.name
+                return await asyncio.to_thread(lambda: DBDParser(tmp_path).parse())
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        # รันทั้งหมดพร้อมกัน: OCR quotation(s) + OCR contract + DBD parse
+        all_results = await asyncio.gather(
+            *quotation_tasks,
+            extract_contract(),
+            parse_dbd_async(),
+            return_exceptions=True,
+        )
+
+        # แยกผลลัพธ์
+        n_q = len(quotation_tasks)
+        quotation_parts = all_results[:n_q]
+        contract_result = all_results[n_q]
+        dbd_result      = all_results[n_q + 1]
+
+        # รวม quotation text
+        quotation_text = ""
+        for part in quotation_parts:
+            if isinstance(part, Exception):
+                logger.error(f"[ OCR QUOTATION ERROR ] {part}")
+            else:
+                quotation_text += part
+
+        # contract text
+        if isinstance(contract_result, Exception):
+            logger.error(f"[ OCR CONTRACT ERROR ] {contract_result}")
+            contract_text = ""
+        else:
+            contract_text = contract_result
+
+        # dbd data
+        dbd_data: dict = {}
+        if isinstance(dbd_result, Exception):
+            logger.error(f"[ DBD PARSE ERROR ] {dbd_result}")
+        else:
+            dbd_data = dbd_result
+
+        logger.info("[ PARALLEL ] OCR + DBD เสร็จสิ้น")
+        logger.info(f"[ TEXT CHECK ] Quotation ({len(quotation_text)} chars) preview: {quotation_text[:300]}")
+        logger.info(f"[ TEXT CHECK ] Contract ({len(contract_text)} chars) preview: {contract_text[:300]}")
 
         # ===============================
-        # STEP 2: FILTER DATA
+        # STEP 3: FILTER DATA
         # ===============================
         company_name        = filter_name_company(quotation_text)
         registration_number = filter_registration_number(contract_text)
 
-        # ===============================
-        # STEP 3: PARSE DBD
-        # ===============================
-        dbd_data: dict = {}
+        # DBD reg matching
         reg_match = False
-
-        try:
-            dbd_bytes = await dbd_pdf.read()
-            dbd_tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(dbd_bytes)
-                    dbd_tmp_path = tmp.name
-                # ออกจาก with block — ไฟล์ปิดแล้ว Windows ให้ลบได้
-                parser   = DBDParser(dbd_tmp_path)
-                dbd_data = parser.parse()
-            finally:
-                if dbd_tmp_path and os.path.exists(dbd_tmp_path):
-                    os.remove(dbd_tmp_path)
-
-            dbd_reg = dbd_data.get("registration_number")
-            if registration_number and dbd_reg and registration_number == dbd_reg:
-                reg_match = True
-
-            # fallback: ถ้า contract ไม่มีเลขทะเบียน ให้ใช้จาก DBD แทน
-            if not registration_number and dbd_reg:
-                registration_number = dbd_reg
-                logger.warning(f"[ REG FALLBACK ] ใช้เลขทะเบียนจาก DBD: {dbd_reg}")
-
-        except Exception as e:
-            logger.error(f"[ DBD ERROR ] {e}")
+        dbd_reg = dbd_data.get("registration_number")
+        if registration_number and dbd_reg and registration_number == dbd_reg:
+            reg_match = True
+        if not registration_number and dbd_reg:
+            registration_number = dbd_reg
+            logger.warning(f"[ REG FALLBACK ] ใช้เลขทะเบียนจาก DBD: {dbd_reg}")
 
         # ===============================
-        # STEP 4: COMPARE DOCUMENTS
+        # STEP 4: LLM — 3 checks แบบ parallel
         # ===============================
-        logger.info("[ Gemini ] Comparing documents...")
-        logger.info(f"[ TEXT CHECK ] Quotation ({len(quotation_text)} chars) preview: {quotation_text[:300]}")
-        logger.info(f"[ TEXT CHECK ] Contract ({len(contract_text)} chars) preview: {contract_text[:300]}")
-        result_one = await asyncio.to_thread(compare_documents, quotation_text, contract_text, dbd_data, client)
+        result_raw = await compare_documents_parallel(
+            quotation_text, contract_text, dbd_data, client
+        )
 
-        # ── คำนวณวันจริงด้วย Python แล้ว inject card เข้า document_comparison ──
-        cp          = result_one.get("contract_period") or {}
+        # inject period card
+        cp          = result_raw.get("contract_period") or {}
         period_card = build_period_card(cp)
         doc_cmp     = (
             ([period_card] if period_card is not None else [])
-            + result_one.get("document_comparison", [])
+            + result_raw.get("document_comparison", [])
         )
 
+        # คำนวณ overall_risk จาก severity ของทุก issue
+        all_issues = (
+            result_raw.get("dbd_validation", [])
+            + doc_cmp
+            + result_raw.get("contract_internal_consistency", [])
+        )
+        severity_counts = {"สูง": 0, "ปานกลาง": 0, "ต่ำ": 0}
+        for issue in all_issues:
+            sev = issue.get("severity", "ต่ำ")
+            if sev in severity_counts:
+                severity_counts[sev] += 1
+        if severity_counts["สูง"] > 0:
+            overall_risk = "สูง"
+        elif severity_counts["ปานกลาง"] > 0:
+            overall_risk = "ปานกลาง"
+        else:
+            overall_risk = "ต่ำ"
+
         result = {
-            "summary":                       result_one.get("summary", {}),
-            "dbd_validation":                sort_by_severity(result_one.get("dbd_validation", [])),
+            "summary":                       {"overall_risk": overall_risk},
+            "dbd_validation":                sort_by_severity(result_raw.get("dbd_validation", [])),
             "document_comparison":           sort_by_severity(doc_cmp),
-            "contract_internal_consistency": sort_by_severity(result_one.get("contract_internal_consistency", [])),
+            "contract_internal_consistency": sort_by_severity(result_raw.get("contract_internal_consistency", [])),
             "raw_dbd_data":                  dbd_data,
             "dbd_reg_match":                 reg_match,
         }
 
         # ===============================
-        # STEP 5: SAVE TO MONGODB (with deduplication)
+        # STEP 5: SAVE TO MONGODB
         # ===============================
         safe_reg = registration_number or "unknown"
-
         try:
             now_ts = int(time.time())
-            dedup_window = 1  # วินาที
-
-            # deduplication: ตรวจสอบว่ามี record ที่มี quotation+contract filename เดิม
             quotation_filenames = sorted([f.filename for f in quotation])
             existing = checks_col.find_one({
                 "registration_number": safe_reg,
                 "quotation_filename":  quotation_filenames,
                 "contract_filename":   contract.filename,
                 "checker_name":        checker_name,
-                "created_at":          {"$gte": now_ts - dedup_window},
+                "created_at":          {"$gte": now_ts - 1},
             })
-
             if existing:
                 logger.warning("[ MONGODB ] Duplicate detected — skipping insert")
             else:
@@ -1220,7 +1331,6 @@ async def recheck(
                     "created_at":          now_ts,
                 })
                 logger.info("[ MONGODB ] Saved successfully")
-
         except Exception as e:
             logger.error(f"[ MONGODB ERROR ] {e}")
 
@@ -1230,3 +1340,5 @@ async def recheck(
         import traceback
         logger.error(f"SYSTEM ERROR: {e}\n{traceback.format_exc()}")
         return {"error": str(e)}
+
+
